@@ -1,20 +1,56 @@
 import os
-import time
 import csv
-import random
-from flask import Flask, request, jsonify, send_file
+import logging
+import uuid
+from flask import Flask, request, jsonify, send_file, session
 from flask_cors import CORS
+from pydantic import BaseModel, Field, ValidationError
+from vastu_analyzer import VastuAnalyzer, generate_sample_vastu_data
+from database import FloorPlanDatabase, migrate_csv_to_db
+from semantic_search import get_search_engine
+from ml_recommender import get_recommender
 
 app = Flask(__name__)
-CORS(app)  # Allow the frontend to communicate with this backend
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+CORS(app, supports_credentials=True)  # Allow the frontend to communicate with this backend
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_FOLDER = os.path.join(BASE_DIR, "dataset", "images", "images")
 CSV_FILE = os.path.join(BASE_DIR, "dataset", "house_plans_details.csv")
 
+# --- INPUT VALIDATION ---
+class FloorPlanRequest(BaseModel):
+    sq_ft: int = Field(ge=500, le=10000, description="Square footage between 500-10000")
+    bedrooms: int = Field(ge=1, le=10, description="Number of bedrooms 1-10")
+    bathrooms: int = Field(ge=1, le=8, description="Number of bathrooms 1-8")
+    garage: int = Field(ge=0, le=5, description="Number of garage spaces 0-5")
+    vastu_compliant: bool = Field(default=False, description="Filter for Vastu compliant plans")
+    min_vastu_score: int = Field(default=0, ge=0, le=100, description="Minimum Vastu score")
+    query_text: str = Field(default="", description="Natural language search query")
+
 # --- SMART HISTORY TRACKER ---
 query_history = {}
+
+# --- VASTU ANALYZER ---
+vastu_analyzer = VastuAnalyzer()
+
+# --- DATABASE ---
+db = FloorPlanDatabase(os.path.join(BASE_DIR, "floorplans.db"))
+
+# --- SEMANTIC SEARCH ---
+search_engine = get_search_engine()
+
+# --- ML RECOMMENDER ---
+recommender = get_recommender()
+
+# --- AI GENERATOR ---
+# We don't initialize it here to save memory. It will lazy-load on first request.
+ai_gen = get_ai_generator()
 
 # --- HELPER: CLEAN NUMBERS ---
 def clean_int(value):
@@ -64,81 +100,478 @@ def load_dataset():
                         "bathrooms": baths,
                         "garage": garage
                     })
-                except: continue
-        print(f"✅ LOADED: {len(data)} entries")
+                except Exception as e:
+                    logger.warning(f"Skipping invalid row: {e}")
+                    continue
+        logger.info(f"✅ LOADED: {len(data)} entries")
         return data
     except Exception as e:
-        print(f"❌ Read Error: {e}")
+        logger.error(f"❌ Read Error: {e}")
         return []
 
+# Load dataset once at startup
 dataset = load_dataset()
+logger.info(f"🚀 Dataset loaded with {len(dataset)} floor plans")
+
+# Check if database is empty and migrate CSV data
+db_stats = db.get_statistics()
+if db_stats['total_plans'] == 0 and len(dataset) > 0:
+    logger.info("📊 Database is empty, migrating CSV data...")
+    migrate_csv_to_db(CSV_FILE, db, vastu_analyzer)
+    logger.info("✅ Migration complete!")
+
+# Initialize semantic search (lazy loading)
+search_engine.initialize()
+
+# Train ML recommender on the loaded dataset
+if dataset:
+    recommender.fit(dataset)
+    logger.info(f"🤖 ML Recommender trained on {len(dataset)} plans")
 
 @app.route('/generate', methods=['POST'])
 def generate():
-    global dataset, query_history
+    global query_history
     
     if not dataset:
-        dataset = load_dataset()
-        if not dataset: return jsonify({"error": "No Dataset"}), 500
+        return jsonify({"error": "Dataset not available", "success": False}), 500
 
-    data = request.json
-    sq_ft = int(data.get('sq_ft', 1500))
-    beds = int(data.get('bedrooms', 3))
-    baths = int(data.get('bathrooms', 2))
-    garage = int(data.get('garage', 1))
+    if not recommender.is_fitted:
+        return jsonify({"error": "ML model not ready", "success": False}), 503
 
-    request_key = f"{sq_ft}_{beds}_{baths}_{garage}"
+    # Validate input data
+    try:
+        request_data = FloorPlanRequest(**request.json)
+    except ValidationError as e:
+        return jsonify({"error": "Invalid input parameters", "details": e.errors(), "success": False}), 400
+    except Exception as e:
+        return jsonify({"error": "Invalid request format", "success": False}), 400
+
+    sq_ft = request_data.sq_ft
+    beds = request_data.bedrooms
+    baths = request_data.bathrooms
+    garage = request_data.garage
+
+    # Get number of results to return (default 6)
+    num_results = request.json.get('num_results', 6)
+    num_results = min(max(num_results, 1), 20)  # Clamp between 1-20
+    
+    # Get Vastu preferences
+    vastu_compliant = request_data.vastu_compliant
+    min_vastu_score = request_data.min_vastu_score
+
+    request_key = f"{sq_ft}_{beds}_{baths}_{garage}_{vastu_compliant}_{min_vastu_score}"
     
     if request_key not in query_history:
         query_history[request_key] = 0
 
-    print(f"\n🎯 Request: {sq_ft} sqft | {beds} Beds (Attempt #{query_history[request_key] + 1})")
+    logger.info(f"🎯 ML Request: {sq_ft} sqft | {beds} beds | {baths} baths | {garage} garage (Attempt #{query_history[request_key] + 1})")
 
-    # --- 1. LONGER COY DELAY ---
-    # Old Formula: 4 + (sq_ft / 500)
-    # NEW Formula: 7s Base + (sq_ft / 400) + Random
-    # Example: 1500 sqft -> 7 + 3.75 = ~10.75 seconds
-    fake_time = 7 + (sq_ft / 400) + random.uniform(0.5, 2.5)
+    # --- ML-POWERED RECOMMENDATION ---
+    # KNN finds the closest plans in normalized feature space
+    ml_results = recommender.recommend(
+        sq_ft=sq_ft,
+        bedrooms=beds,
+        bathrooms=baths,
+        garage=garage,
+        top_n=num_results * 3,  # Get extra candidates for Vastu filtering
+        vastu_min_score=min_vastu_score if (vastu_compliant or min_vastu_score > 0) else 0
+    )
+
+    # Apply Vastu filtering on ML results
+    if vastu_compliant or min_vastu_score > 0:
+        vastu_filtered = []
+        for plan in ml_results:
+            vastu_features = generate_sample_vastu_data(plan['filename'])
+            vastu_result = vastu_analyzer.calculate_vastu_score(vastu_features)
+            plan['vastu_score'] = vastu_result['score']
+            plan['vastu_data'] = vastu_result
+            
+            if plan['vastu_score'] >= min_vastu_score:
+                if not vastu_compliant or plan['vastu_score'] >= 70:
+                    vastu_filtered.append(plan)
+        
+        ml_results = vastu_filtered
+        logger.info(f"🕉️ Vastu filter: {len(vastu_filtered)} plans meet criteria")
+
+    # Take top N after filtering
+    results_to_return = ml_results[:num_results]
     
-    print(f"⏳ Processing (Extended): {fake_time:.2f}s...")
-    time.sleep(fake_time)
-
-    # --- 2. CYCLING RETRIEVAL LOGIC ---
-    candidates = [d for d in dataset if d['bedrooms'] == beds]
-    if not candidates:
-        candidates = [d for d in dataset if abs(d['bedrooms'] - beds) <= 1]
-    if not candidates:
-        candidates = dataset
-
-    ranked_candidates = sorted(candidates, key=lambda x: abs(x['sq_ft'] - sq_ft))
-
-    current_index = query_history[request_key]
-    final_index = current_index % len(ranked_candidates)
-    
-    best_match = ranked_candidates[final_index]
+    # Format results with metadata
+    results = []
+    for idx, plan in enumerate(results_to_return):
+        # Add Vastu score if not already present
+        if 'vastu_score' not in plan:
+            vastu_features = generate_sample_vastu_data(plan['filename'])
+            vastu_result = vastu_analyzer.calculate_vastu_score(vastu_features)
+            plan['vastu_score'] = vastu_result['score']
+            plan['vastu_data'] = vastu_result
+        
+        results.append({
+            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "details": {
+                "filename": plan['filename'],
+                "sq_ft": plan['sq_ft'],
+                "bedrooms": plan['bedrooms'],
+                "bathrooms": plan['bathrooms'],
+                "garage": plan['garage']
+            },
+            "metadata": {
+                "match_quality": plan.get('match_quality', 'fair'),
+                "sq_ft_difference": plan.get('sq_ft_difference', 0),
+                "ml_distance": round(plan.get('ml_distance', 0), 3),
+                "rank": idx + 1
+            },
+            "vastu": {
+                "score": plan['vastu_score'],
+                "compliance_level": plan['vastu_data']['compliance_level'],
+                "emoji": plan['vastu_data']['emoji'],
+                "details": plan['vastu_data']['details'],
+                "recommendations": plan['vastu_data']['recommendations']
+            }
+        })
     
     query_history[request_key] += 1
 
-    diff = abs(best_match['sq_ft'] - sq_ft)
-    print(f"✅ Served Option #{final_index + 1}: {best_match['filename']} (Diff: {diff} sqft)")
+    logger.info(f"✅ ML returned {len(results)} results")
 
-    timestamp = int(time.time())
     return jsonify({
-        "image_url": f"http://127.0.0.1:5000/image/{best_match['filename']}?t={timestamp}",
-        "details": best_match
+        "success": True,
+        "results": results,
+        "summary": {
+            "total_candidates": len(ml_results),
+            "returned": len(results),
+            "best_match_diff": results_to_return[0].get('sq_ft_difference', 0) if results_to_return else 0,
+            "engine": "knn-ml-v1"
+        }
     })
 
 @app.route('/image/<filename>')
 def get_image(filename):
+    # Security: prevent directory traversal
+    if '..' in filename or '/' in filename:
+        return jsonify({"error": "Invalid filename"}), 400
+        
     file_path = os.path.join(IMAGE_FOLDER, filename)
     if os.path.exists(file_path):
-        mimetype = 'image/jpeg' if filename.lower().endswith('.jpg') else 'image/png'
+        mimetype = 'image/jpeg' if filename.lower().endswith(('.jpg', '.jpeg')) else 'image/png'
         return send_file(file_path, mimetype=mimetype)
     else:
-        print(f"❌ Missing Image: {file_path}")
-        return "Not found", 404
+        logger.warning(f"❌ Missing Image: {file_path}")
+        return jsonify({"error": "Image not found"}), 404
+
+@app.route('/api/stats')
+def get_stats():
+    """Get dataset statistics including Vastu analysis"""
+    if not dataset:
+        return jsonify({"error": "Dataset not available"}), 500
+    
+    bedroom_counts = {}
+    bathroom_counts = {}
+    garage_counts = {}
+    vastu_excellent = 0
+    vastu_good = 0
+    vastu_fair = 0
+    vastu_poor = 0
+    
+    for plan in dataset:
+        bedroom_counts[plan['bedrooms']] = bedroom_counts.get(plan['bedrooms'], 0) + 1
+        bathroom_counts[plan['bathrooms']] = bathroom_counts.get(plan['bathrooms'], 0) + 1
+        garage_counts[plan['garage']] = garage_counts.get(plan['garage'], 0) + 1
+        
+        # Calculate Vastu score for statistics (sample first 100 for performance)
+    
+    # Sample 100 plans for Vastu distribution
+    import random
+    sample_plans = random.sample(dataset, min(100, len(dataset)))
+    for plan in sample_plans:
+        vastu_features = generate_sample_vastu_data(plan['filename'])
+        vastu_result = vastu_analyzer.calculate_vastu_score(vastu_features)
+        score = vastu_result['score']
+        
+        if score >= 85:
+            vastu_excellent += 1
+        elif score >= 70:
+            vastu_good += 1
+        elif score >= 50:
+            vastu_fair += 1
+        else:
+            vastu_poor += 1
+    
+    return jsonify({
+        "success": True,
+        "total_plans": len(dataset),
+        "bedroom_distribution": bedroom_counts,
+        "bathroom_distribution": bathroom_counts,
+        "garage_distribution": garage_counts,
+        "sq_ft_range": {
+            "min": min(plan['sq_ft'] for plan in dataset),
+            "max": max(plan['sq_ft'] for plan in dataset),
+            "avg": sum(plan['sq_ft'] for plan in dataset) / len(dataset)
+        },
+        "vastu_distribution": {
+            "excellent": vastu_excellent,
+            "good": vastu_good,
+            "fair": vastu_fair,
+            "poor": vastu_poor,
+            "total_analyzed": len(sample_plans)
+        }
+    })
+
+@app.route('/api/vastu/info')
+def vastu_info():
+    """Get Vastu principles and guidelines"""
+    from vastu_analyzer import VastuRules
+    
+    rules = VastuRules()
+    
+    return jsonify({
+        "success": True,
+        "guidelines": rules.GUIDELINES,
+        "room_placements": {
+            direction.value: {
+                "ideal": info["ideal"],
+                "avoid": info["avoid"],
+                "importance": info["importance"]
+            }
+            for direction, info in rules.ROOM_PLACEMENTS.items()
+        },
+        "general_tips": vastu_analyzer._get_general_tips()
+    })
+
+@app.route('/api/search/semantic', methods=['POST'])
+def semantic_search():
+    """Natural language search for floor plans"""
+    data = request.json
+    query = data.get('query', '')
+    limit = min(data.get('limit', 10), 20)
+    
+    if not query:
+        return jsonify({"error": "Query text required", "success": False}), 400
+    
+    # Get session ID
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    
+    logger.info(f"🔍 Semantic search: '{query}'")
+    
+    # Get all plans from database
+    all_plans = db.get_all_plans()
+    
+    if not search_engine.is_available():
+        logger.warning("Semantic search not available, falling back to basic search")
+        return jsonify({
+            "success": False,
+            "error": "Semantic search not available. Install sentence-transformers.",
+            "fallback": True
+        }), 503
+    
+    # Perform semantic search
+    results = search_engine.search_by_text(query, all_plans, limit)
+    
+    # Format results
+    formatted_results = []
+    for plan, similarity in results:
+        formatted_results.append({
+            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "details": {
+                "filename": plan['filename'],
+                "sq_ft": plan['sq_ft'],
+                "bedrooms": plan['bedrooms'],
+                "bathrooms": plan['bathrooms'],
+                "garage": plan.get('garages', 0),
+                "style": plan.get('style')
+            },
+            "similarity": round(similarity, 3),
+            "vastu": {
+                "score": plan.get('vastu_score', 0)
+            }
+        })
+    
+    # Log search
+    db.log_search(session['session_id'], {'query_text': query}, len(formatted_results))
+    
+    return jsonify({
+        "success": True,
+        "results": formatted_results,
+        "query": query,
+        "count": len(formatted_results)
+    })
+
+@app.route('/api/similar/<filename>', methods=['GET'])
+def find_similar(filename):
+    """Find similar floor plans to the given plan"""
+    limit = min(int(request.args.get('limit', 6)), 20)
+    
+    logger.info(f"🔍 Find similar to: {filename}")
+    
+    # Get reference plan
+    reference_plan = db.get_plan_by_filename(filename)
+    if not reference_plan:
+        return jsonify({"error": "Plan not found", "success": False}), 404
+    
+    # Get all plans
+    all_plans = db.get_all_plans()
+    
+    if not search_engine.is_available():
+        # Fallback: use basic similarity (sq_ft + bedrooms)
+        similar = sorted(
+            [p for p in all_plans if p['filename'] != filename],
+            key=lambda x: abs(x['sq_ft'] - reference_plan['sq_ft']) + abs(x['bedrooms'] - reference_plan['bedrooms']) * 200
+        )[:limit]
+        
+        results = [{
+            "image_url": f"http://127.0.0.1:5000/image/{p['filename']}",
+            "details": {
+                "filename": p['filename'],
+                "sq_ft": p['sq_ft'],
+                "bedrooms": p['bedrooms'],
+                "bathrooms": p['bathrooms'],
+                "garage": p.get('garages', 0)
+            },
+            "similarity": 0.5  # Default similarity
+        } for p in similar]
+    else:
+        # Use semantic similarity
+        similar_plans = search_engine.find_similar(reference_plan, all_plans, limit)
+        
+        results = [{
+            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "details": {
+                "filename": plan['filename'],
+                "sq_ft": plan['sq_ft'],
+                "bedrooms": plan['bedrooms'],
+                "bathrooms": plan['bathrooms'],
+                "garage": plan.get('garages', 0),
+                "style": plan.get('style')
+            },
+            "similarity": round(similarity, 3)
+        } for plan, similarity in similar_plans]
+    
+    return jsonify({
+        "success": True,
+        "reference": {
+            "filename": reference_plan['filename'],
+            "sq_ft": reference_plan['sq_ft'],
+            "bedrooms": reference_plan['bedrooms']
+        },
+        "results": results,
+        "count": len(results)
+    })
+
+@app.route('/api/favorites', methods=['GET', 'POST', 'DELETE'])
+def manage_favorites():
+    """Manage user favorites"""
+    # Get or create session ID
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    
+    session_id = session['session_id']
+    
+    if request.method == 'GET':
+        # Get all favorites
+        favorites = db.get_favorites(session_id)
+        
+        results = [{
+            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "details": {
+                "id": plan['id'],
+                "filename": plan['filename'],
+                "sq_ft": plan['sq_ft'],
+                "bedrooms": plan['bedrooms'],
+                "bathrooms": plan['bathrooms'],
+                "garage": plan.get('garages', 0),
+                "style": plan.get('style')
+            }
+        } for plan in favorites]
+        
+        return jsonify({
+            "success": True,
+            "favorites": results,
+            "count": len(results)
+        })
+    
+    elif request.method == 'POST':
+        # Add to favorites
+        data = request.json
+        filename = data.get('filename')
+        
+        if not filename:
+            return jsonify({"error": "Filename required", "success": False}), 400
+        
+        plan = db.get_plan_by_filename(filename)
+        if not plan:
+            return jsonify({"error": "Plan not found", "success": False}), 404
+        
+        added = db.add_favorite(session_id, plan['id'])
+        
+        return jsonify({
+            "success": True,
+            "added": added,
+            "message": "Added to favorites" if added else "Already in favorites"
+        })
+    
+    elif request.method == 'DELETE':
+        # Remove from favorites
+        data = request.json
+        filename = data.get('filename')
+        
+        if not filename:
+            return jsonify({"error": "Filename required", "success": False}), 400
+        
+        plan = db.get_plan_by_filename(filename)
+        if not plan:
+            return jsonify({"error": "Plan not found", "success": False}), 404
+        
+        removed = db.remove_favorite(session_id, plan['id'])
+        
+        return jsonify({
+            "success": True,
+            "removed": removed,
+            "message": "Removed from favorites" if removed else "Not in favorites"
+        })
+
+@app.route('/api/generate/ai', methods=['POST'])
+def generate_ai_floorplan():
+    """
+    Generate a brand new floor plan from a text prompt using Stable Diffusion.
+    """
+    try:
+        data = request.json
+        if not data or 'prompt' not in data:
+            return jsonify({"error": "Prompt is required", "success": False}), 400
+            
+        prompt = data['prompt']
+        
+        # Optional parameters
+        style = data.get('style', 'modern')
+        width = int(data.get('width', 512))
+        height = int(data.get('height', 512))
+        
+        # Enhance prompt with style keyword
+        enhanced_prompt = f"{style} style, {prompt}"
+        
+        logger.info(f"🎨 API Request: Generate AI Floor Plan -> '{enhanced_prompt}'")
+        
+        # This will take several seconds to run
+        result = ai_gen.generate_from_text(enhanced_prompt, width=width, height=height)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error generating AI floor plan: {traceback.format_exc()}")
+        return jsonify({"error": str(e), "success": False}), 500
 
 if __name__ == '__main__':
-    if not os.path.exists(IMAGE_FOLDER): os.makedirs(IMAGE_FOLDER)
-    print("🚀 Backend Running (Longer Loading Time)")
-    app.run(debug=True, port=5000)
+    if not os.path.exists(IMAGE_FOLDER): 
+        os.makedirs(IMAGE_FOLDER)
+        logger.warning(f"Created missing image folder: {IMAGE_FOLDER}")
+    
+    # Check if we have data
+    if not dataset:
+        logger.error("❌ No dataset loaded - check CSV file and image paths")
+    
+    logger.info("🚀 Floor Plan Generator Backend Started")
+    logger.info(f"📁 Serving images from: {IMAGE_FOLDER}")
+    logger.info(f"📊 Dataset: {len(dataset)} plans loaded")
+    
+    app.run(debug=True, port=5000, host='127.0.0.1')

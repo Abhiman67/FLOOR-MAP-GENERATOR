@@ -222,19 +222,29 @@ Generate a floor plan based on requirements.
 **Response:**
 ```json
 {
-  "image_url": "http://127.0.0.1:5000/image/floor_plan_001.jpg?t=1234567890",
+  "success": true,
+  "image_url": "http://127.0.0.1:5000/image/floor_plan_001.jpg",
   "details": {
     "filename": "floor_plan_001.jpg",
     "sq_ft": 2500,
     "bedrooms": 3,
     "bathrooms": 2,
     "garage": 2
+  },
+  "metadata": {
+    "match_quality": "excellent",
+    "sq_ft_difference": 0,
+    "result_number": 1,
+    "total_candidates": 23
   }
 }
 ```
 
 ### `GET /image/<filename>`
 Retrieve a specific floor plan image.
+
+### `GET /api/stats`
+Get dataset statistics including distribution of bedrooms, bathrooms, and square footage ranges.
 
 ## 🚧 Future Enhancements
 
