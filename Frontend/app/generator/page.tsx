@@ -13,7 +13,7 @@ import ThemeToggle from "@/components/theme-toggle"
 import { useToast } from "@/hooks/use-toast"
 import { Home, ArrowLeft, Search, Wand2, ScanLine, Sparkles, Compass } from "lucide-react"
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:5001'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:5000'
 
 async function safeJson(res: Response) {
   const ct = res.headers.get('content-type') || ''

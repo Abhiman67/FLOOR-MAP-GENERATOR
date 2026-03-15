@@ -3,6 +3,7 @@ import csv
 import logging
 import uuid
 import traceback
+from collections import OrderedDict
 from flask import Flask, request, jsonify, send_file, send_from_directory, session
 from flask_cors import CORS
 from pydantic import BaseModel, Field, ValidationError
@@ -14,18 +15,34 @@ from ai_generator import get_ai_generator
 from floorplan_recognizer import get_recognizer
 from image_search import get_image_search_engine
 
-app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-CORS(app, supports_credentials=True)  # Allow the frontend to communicate with this backend
-
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# --- SECRET KEY ---
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
+if os.environ.get('FLASK_ENV') == 'production' and app.secret_key == 'dev-secret-key-change-in-production':
+    logger.error("❌ SECURITY: SECRET_KEY must be set in production. Using default is not allowed.")
+    raise RuntimeError("SECRET_KEY environment variable must be set in production mode.")
+
+# --- CORS ---
+ALLOWED_ORIGINS = os.environ.get('ALLOWED_ORIGINS', '*')
+if ALLOWED_ORIGINS == '*':
+    CORS(app, supports_credentials=True)
+else:
+    CORS(app, origins=ALLOWED_ORIGINS.split(','), supports_credentials=True)
 
 # --- CONFIGURATION ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGE_FOLDER = os.path.join(BASE_DIR, "dataset", "images", "images")
 CSV_FILE = os.path.join(BASE_DIR, "dataset", "house_plans_details.csv")
+MAX_UPLOAD_SIZE = int(os.environ.get('MAX_UPLOAD_SIZE', 10 * 1024 * 1024))  # 10MB default
+ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+
+# --- MAX QUERY HISTORY ---
+MAX_QUERY_HISTORY = 1000
 
 # --- INPUT VALIDATION ---
 class FloorPlanRequest(BaseModel):
@@ -37,8 +54,19 @@ class FloorPlanRequest(BaseModel):
     min_vastu_score: int = Field(default=0, ge=0, le=100, description="Minimum Vastu score")
     query_text: str = Field(default="", description="Natural language search query")
 
-# --- SMART HISTORY TRACKER ---
-query_history = {}
+# --- SMART HISTORY TRACKER (bounded to prevent memory leak) ---
+class BoundedDict(OrderedDict):
+    """Dictionary with a maximum size, evicting oldest entries."""
+    def __init__(self, max_size=MAX_QUERY_HISTORY, *args, **kwargs):
+        self.max_size = max_size
+        super().__init__(*args, **kwargs)
+
+    def __setitem__(self, key, value):
+        if key not in self and len(self) >= self.max_size:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+query_history = BoundedDict()
 
 # --- VASTU ANALYZER ---
 vastu_analyzer = VastuAnalyzer()
@@ -68,11 +96,40 @@ def clean_int(value):
     except ValueError:
         return None
 
+def _build_image_url(filename):
+    """Build image URL using request context or environment variable."""
+    base_url = os.environ.get('BASE_URL')
+    if base_url:
+        return f"{base_url.rstrip('/')}/image/{filename}"
+    if request:
+        return f"{request.host_url.rstrip('/')}/image/{filename}"
+    return f"/image/{filename}"
+
+def _validate_upload_file(file):
+    """Validate an uploaded file for size and type. Returns (ok, error_message)."""
+    if not file or not file.filename:
+        return False, "No file provided"
+
+    # Check file extension
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_IMAGE_EXTENSIONS:
+        return False, f"File type '{ext}' not allowed. Accepted: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
+
+    # Check file size by reading into memory (Flask doesn't expose content-length reliably)
+    file.seek(0, os.SEEK_END)
+    size = file.tell()
+    file.seek(0)
+    if size > MAX_UPLOAD_SIZE:
+        max_mb = MAX_UPLOAD_SIZE / (1024 * 1024)
+        return False, f"File too large ({size / (1024*1024):.1f}MB). Maximum allowed: {max_mb:.0f}MB"
+
+    return True, None
+
 # --- LOAD DATASET ---
 def load_dataset():
     data = []
     if not os.path.exists(CSV_FILE):
-        print(f"❌ CRITICAL ERROR: '{CSV_FILE}' not found.")
+        logger.error(f"❌ CRITICAL ERROR: '{CSV_FILE}' not found.")
         return []
     try:
         with open(CSV_FILE, mode='r', encoding='utf-8-sig') as f:
@@ -80,12 +137,12 @@ def load_dataset():
             if reader.fieldnames:
                 reader.fieldnames = [name.strip() for name in reader.fieldnames]
             
-            print(f"🔍 CSV Headers: {reader.fieldnames}")
+            logger.info(f"🔍 CSV Headers: {reader.fieldnames}")
             
             required = ['Image Path', 'Square Feet', 'Beds', 'Baths', 'Garages']
             for col in required:
                 if col not in reader.fieldnames:
-                    print(f"❌ ERROR: Missing column '{col}'")
+                    logger.error(f"❌ ERROR: Missing column '{col}'")
                     return []
 
             for row in reader:
@@ -219,7 +276,7 @@ def generate():
             plan['vastu_data'] = vastu_result
         
         results.append({
-            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
+            "image_url": _build_image_url(plan['filename']),
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -260,10 +317,15 @@ def generate():
 @app.route('/image/<filename>')
 def get_image(filename):
     # Security: prevent directory traversal
-    if '..' in filename or '/' in filename:
+    if '..' in filename or '/' in filename or '\\' in filename:
         return jsonify({"error": "Invalid filename"}), 400
-        
-    file_path = os.path.join(IMAGE_FOLDER, filename)
+
+    # Resolve and validate the path is within the allowed directory
+    file_path = os.path.realpath(os.path.join(IMAGE_FOLDER, filename))
+    allowed_dir = os.path.realpath(IMAGE_FOLDER)
+    if not file_path.startswith(allowed_dir + os.sep) and file_path != allowed_dir:
+        return jsonify({"error": "Invalid filename"}), 400
+
     if os.path.exists(file_path):
         mimetype = 'image/jpeg' if filename.lower().endswith(('.jpg', '.jpeg')) else 'image/png'
         return send_file(file_path, mimetype=mimetype)
@@ -384,7 +446,7 @@ def semantic_search():
     formatted_results = []
     for plan, similarity in results:
         formatted_results.append({
-            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
+            "image_url": _build_image_url(plan['filename']),
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -432,7 +494,7 @@ def find_similar(filename):
         )[:limit]
         
         results = [{
-            "image_url": f"http://127.0.0.1:5001/image/{p['filename']}",
+            "image_url": _build_image_url(p['filename']),
             "details": {
                 "filename": p['filename'],
                 "sq_ft": p['sq_ft'],
@@ -447,7 +509,7 @@ def find_similar(filename):
         similar_plans = search_engine.find_similar(reference_plan, all_plans, limit)
         
         results = [{
-            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
+            "image_url": _build_image_url(plan['filename']),
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -484,7 +546,7 @@ def manage_favorites():
         favorites = db.get_favorites(session_id)
         
         results = [{
-            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
+            "image_url": _build_image_url(plan['filename']),
             "details": {
                 "id": plan['id'],
                 "filename": plan['filename'],
@@ -583,6 +645,10 @@ def generate_sketch_floorplan():
             return jsonify({"error": "Sketch image is required", "success": False}), 400
             
         file = request.files['image']
+        valid, error_msg = _validate_upload_file(file)
+        if not valid:
+            return jsonify({"error": error_msg, "success": False}), 400
+
         prompt = request.form.get('prompt', 'standard floor plan')
         
         # Read the image
@@ -610,6 +676,9 @@ def recognize_floorplan():
             return jsonify({"error": "Image is required", "success": False}), 400
             
         file = request.files['image']
+        valid, error_msg = _validate_upload_file(file)
+        if not valid:
+            return jsonify({"error": error_msg, "success": False}), 400
         
         from PIL import Image
         image = Image.open(file.stream).convert("RGB")
@@ -633,6 +702,9 @@ def search_by_image():
             return jsonify({"error": "Image is required", "success": False}), 400
             
         file = request.files['image']
+        valid, error_msg = _validate_upload_file(file)
+        if not valid:
+            return jsonify({"error": error_msg, "success": False}), 400
         
         from PIL import Image
         image = Image.open(file.stream).convert("RGB")
@@ -645,6 +717,17 @@ def search_by_image():
     except Exception as e:
         logger.error(f"Error in reverse image search: {traceback.format_exc()}")
         return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint for monitoring and Docker health checks."""
+    return jsonify({
+        "status": "healthy",
+        "dataset_loaded": len(dataset) > 0,
+        "dataset_size": len(dataset),
+        "ml_model_ready": recommender.is_fitted,
+        "semantic_search_available": search_engine.is_available()
+    })
 
 if __name__ == '__main__':
     if not os.path.exists(IMAGE_FOLDER): 
@@ -659,4 +742,7 @@ if __name__ == '__main__':
     logger.info(f"📁 Serving images from: {IMAGE_FOLDER}")
     logger.info(f"📊 Dataset: {len(dataset)} plans loaded")
     
-    app.run(debug=True, port=5000, host='127.0.0.1')
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', 5000))
+    debug = os.environ.get('FLASK_DEBUG', 'True').lower() in ('true', '1', 'yes')
+    app.run(debug=debug, port=port, host=host)
