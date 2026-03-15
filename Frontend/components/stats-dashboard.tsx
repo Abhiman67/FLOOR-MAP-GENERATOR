@@ -16,7 +16,7 @@ interface DatasetStats {
   }
 }
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:5000'
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:5001'
 
 export default function StatsDashboard() {
   const [stats, setStats] = useState<DatasetStats | null>(null)
@@ -24,7 +24,12 @@ export default function StatsDashboard() {
 
   useEffect(() => {
     fetch(`${API_URL}/api/stats`)
-      .then(res => res.json())
+      .then(res => {
+        if (!res.headers.get('content-type')?.includes('application/json')) {
+          throw new Error(`Backend unavailable (HTTP ${res.status})`)
+        }
+        return res.json()
+      })
       .then(data => {
         if (data.success) {
           setStats(data)
@@ -68,7 +73,7 @@ export default function StatsDashboard() {
 
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
         {/* Total Plans */}
-        <div className="bg-gradient-to-br from-amber-50 to-orange-50 rounded-lg p-4 text-center border border-amber-200">
+        <div className="bg-linear-to-br from-amber-50 to-orange-50 rounded-lg p-4 text-center border border-amber-200">
           <div className="flex justify-center mb-2">
             <TrendingUp className="w-6 h-6 text-amber-600" />
           </div>
@@ -77,7 +82,7 @@ export default function StatsDashboard() {
         </div>
 
         {/* Bedrooms */}
-        <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-lg p-4 text-center border border-blue-200">
+        <div className="bg-linear-to-br from-blue-50 to-indigo-50 rounded-lg p-4 text-center border border-blue-200">
           <div className="flex justify-center mb-2">
             <Home className="w-6 h-6 text-blue-600" />
           </div>
@@ -86,7 +91,7 @@ export default function StatsDashboard() {
         </div>
 
         {/* Bathrooms */}
-        <div className="bg-gradient-to-br from-purple-50 to-pink-50 rounded-lg p-4 text-center border border-purple-200">
+        <div className="bg-linear-to-br from-purple-50 to-pink-50 rounded-lg p-4 text-center border border-purple-200">
           <div className="flex justify-center mb-2">
             <Bath className="w-6 h-6 text-purple-600" />
           </div>
@@ -95,7 +100,7 @@ export default function StatsDashboard() {
         </div>
 
         {/* Garage */}
-        <div className="bg-gradient-to-br from-green-50 to-emerald-50 rounded-lg p-4 text-center border border-green-200">
+        <div className="bg-linear-to-br from-green-50 to-emerald-50 rounded-lg p-4 text-center border border-green-200">
           <div className="flex justify-center mb-2">
             <Car className="w-6 h-6 text-green-600" />
           </div>
@@ -104,7 +109,7 @@ export default function StatsDashboard() {
         </div>
 
         {/* Average Size */}
-        <div className="bg-gradient-to-br from-orange-50 to-red-50 rounded-lg p-4 text-center border border-orange-200">
+        <div className="bg-linear-to-br from-orange-50 to-red-50 rounded-lg p-4 text-center border border-orange-200">
           <div className="flex justify-center mb-2">
             <Activity className="w-6 h-6 text-orange-600" />
           </div>

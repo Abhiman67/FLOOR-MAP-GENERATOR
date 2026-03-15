@@ -2,13 +2,17 @@ import os
 import csv
 import logging
 import uuid
-from flask import Flask, request, jsonify, send_file, session
+import traceback
+from flask import Flask, request, jsonify, send_file, send_from_directory, session
 from flask_cors import CORS
 from pydantic import BaseModel, Field, ValidationError
 from vastu_analyzer import VastuAnalyzer, generate_sample_vastu_data
 from database import FloorPlanDatabase, migrate_csv_to_db
 from semantic_search import get_search_engine
 from ml_recommender import get_recommender
+from ai_generator import get_ai_generator
+from floorplan_recognizer import get_recognizer
+from image_search import get_image_search_engine
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
@@ -51,6 +55,10 @@ recommender = get_recommender()
 # --- AI GENERATOR ---
 # We don't initialize it here to save memory. It will lazy-load on first request.
 ai_gen = get_ai_generator()
+
+# --- AI RECOGNIZER & REVERSE SEARCH ---
+recognizer = get_recognizer()
+image_search = get_image_search_engine()
 
 # --- HELPER: CLEAN NUMBERS ---
 def clean_int(value):
@@ -127,6 +135,10 @@ search_engine.initialize()
 if dataset:
     recommender.fit(dataset)
     logger.info(f"🤖 ML Recommender trained on {len(dataset)} plans")
+
+# Initialize Image Search Index (in background / eager load)
+# image_search.build_index(IMAGE_FOLDER)  # Uncomment in production to rebuild index
+# image_search.initialize()
 
 @app.route('/generate', methods=['POST'])
 def generate():
@@ -207,7 +219,7 @@ def generate():
             plan['vastu_data'] = vastu_result
         
         results.append({
-            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -372,7 +384,7 @@ def semantic_search():
     formatted_results = []
     for plan, similarity in results:
         formatted_results.append({
-            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -420,7 +432,7 @@ def find_similar(filename):
         )[:limit]
         
         results = [{
-            "image_url": f"http://127.0.0.1:5000/image/{p['filename']}",
+            "image_url": f"http://127.0.0.1:5001/image/{p['filename']}",
             "details": {
                 "filename": p['filename'],
                 "sq_ft": p['sq_ft'],
@@ -435,7 +447,7 @@ def find_similar(filename):
         similar_plans = search_engine.find_similar(reference_plan, all_plans, limit)
         
         results = [{
-            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
             "details": {
                 "filename": plan['filename'],
                 "sq_ft": plan['sq_ft'],
@@ -472,7 +484,7 @@ def manage_favorites():
         favorites = db.get_favorites(session_id)
         
         results = [{
-            "image_url": f"http://127.0.0.1:5000/image/{plan['filename']}",
+            "image_url": f"http://127.0.0.1:5001/image/{plan['filename']}",
             "details": {
                 "id": plan['id'],
                 "filename": plan['filename'],
@@ -559,6 +571,79 @@ def generate_ai_floorplan():
         
     except Exception as e:
         logger.error(f"Error generating AI floor plan: {traceback.format_exc()}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/api/generate/from-sketch', methods=['POST'])
+def generate_sketch_floorplan():
+    """
+    Transform a rough sketch into a professional floor plan using ControlNet.
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "Sketch image is required", "success": False}), 400
+            
+        file = request.files['image']
+        prompt = request.form.get('prompt', 'standard floor plan')
+        
+        # Read the image
+        from PIL import Image
+        image = Image.open(file.stream).convert("RGB")
+        
+        logger.info(f"🎨 API Request: Generate from Sketch -> '{prompt}'")
+        
+        # Run ControlNet
+        result = ai_gen.generate_from_sketch(image, prompt)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error generating from sketch: {traceback.format_exc()}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/api/upload/recognize', methods=['POST'])
+def recognize_floorplan():
+    """
+    Upload a floor plan image and use AI to recognize rooms and dimensions.
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "Image is required", "success": False}), 400
+            
+        file = request.files['image']
+        
+        from PIL import Image
+        image = Image.open(file.stream).convert("RGB")
+        
+        logger.info(f"🔍 API Request: Recognize Floor Plan structure")
+        
+        result = recognizer.recognize(image)
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error recognizing floor plan: {traceback.format_exc()}")
+        return jsonify({"error": str(e), "success": False}), 500
+
+@app.route('/api/search/image', methods=['POST'])
+def search_by_image():
+    """
+    Reverse image search to find similar floor plans in the dataset.
+    """
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "Image is required", "success": False}), 400
+            
+        file = request.files['image']
+        
+        from PIL import Image
+        image = Image.open(file.stream).convert("RGB")
+        
+        logger.info(f"🔍 API Request: Reverse Image Search")
+        
+        results = image_search.search_by_image(image)
+        return jsonify({"success": True, "results": results})
+        
+    except Exception as e:
+        logger.error(f"Error in reverse image search: {traceback.format_exc()}")
         return jsonify({"error": str(e), "success": False}), 500
 
 if __name__ == '__main__':
