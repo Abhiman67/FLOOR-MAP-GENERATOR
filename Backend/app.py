@@ -3,8 +3,9 @@ import csv
 import logging
 import uuid
 import traceback
+import threading
 from collections import OrderedDict
-from flask import Flask, request, jsonify, send_file, send_from_directory, session
+from flask import Flask, request, jsonify, send_file, send_from_directory, session, has_request_context
 from flask_cors import CORS
 from pydantic import BaseModel, Field, ValidationError
 from vastu_analyzer import VastuAnalyzer, generate_sample_vastu_data
@@ -56,15 +57,17 @@ class FloorPlanRequest(BaseModel):
 
 # --- SMART HISTORY TRACKER (bounded to prevent memory leak) ---
 class BoundedDict(OrderedDict):
-    """Dictionary with a maximum size, evicting oldest entries."""
+    """Thread-safe dictionary with a maximum size, evicting oldest entries."""
     def __init__(self, max_size=MAX_QUERY_HISTORY, *args, **kwargs):
         self.max_size = max_size
+        self._lock = threading.Lock()
         super().__init__(*args, **kwargs)
 
     def __setitem__(self, key, value):
-        if key not in self and len(self) >= self.max_size:
-            self.popitem(last=False)
-        super().__setitem__(key, value)
+        with self._lock:
+            if key not in self and len(self) >= self.max_size:
+                self.popitem(last=False)
+            super().__setitem__(key, value)
 
 query_history = BoundedDict()
 
@@ -101,7 +104,7 @@ def _build_image_url(filename):
     base_url = os.environ.get('BASE_URL')
     if base_url:
         return f"{base_url.rstrip('/')}/image/{filename}"
-    if request:
+    if has_request_context():
         return f"{request.host_url.rstrip('/')}/image/{filename}"
     return f"/image/{filename}"
 
@@ -115,7 +118,13 @@ def _validate_upload_file(file):
     if ext not in ALLOWED_IMAGE_EXTENSIONS:
         return False, f"File type '{ext}' not allowed. Accepted: {', '.join(ALLOWED_IMAGE_EXTENSIONS)}"
 
-    # Check file size by reading into memory (Flask doesn't expose content-length reliably)
+    # Check file size: use content_length header if available, else read size
+    content_length = request.content_length
+    if content_length and content_length > MAX_UPLOAD_SIZE:
+        max_mb = MAX_UPLOAD_SIZE / (1024 * 1024)
+        return False, f"File too large ({content_length / (1024*1024):.1f}MB). Maximum allowed: {max_mb:.0f}MB"
+
+    # Fallback: check actual stream size
     file.seek(0, os.SEEK_END)
     size = file.tell()
     file.seek(0)
@@ -323,7 +332,11 @@ def get_image(filename):
     # Resolve and validate the path is within the allowed directory
     file_path = os.path.realpath(os.path.join(IMAGE_FOLDER, filename))
     allowed_dir = os.path.realpath(IMAGE_FOLDER)
-    if not file_path.startswith(allowed_dir + os.sep) and file_path != allowed_dir:
+    try:
+        if os.path.commonpath([file_path, allowed_dir]) != allowed_dir:
+            return jsonify({"error": "Invalid filename"}), 400
+    except ValueError:
+        # commonpath raises ValueError if paths are on different drives (Windows)
         return jsonify({"error": "Invalid filename"}), 400
 
     if os.path.exists(file_path):
