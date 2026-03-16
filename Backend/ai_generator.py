@@ -16,10 +16,14 @@ logger = logging.getLogger(__name__)
 
 class AIFloorPlanGenerator:
     def __init__(self):
-        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
-        # If running on Linux/Windows with Nvidia GPU, use "cuda"
-        if torch.cuda.is_available():
-            self.device = "cuda"
+        try:
+            self.device = "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = "mps"
+        except Exception:
+            self.device = "cpu"
             
         logger.info(f"🚀 AI Generator initializing on device: {self.device}")
         
@@ -119,7 +123,7 @@ class AIFloorPlanGenerator:
         return {
             "success": True,
             "filename": filename,
-            "image_url": f"http://127.0.0.1:5000/generated/{filename}",
+            "image_url": f"/generated/{filename}",
             "prompt": prompt
         }
 
@@ -168,7 +172,7 @@ class AIFloorPlanGenerator:
         return {
             "success": True,
             "filename": filename,
-            "image_url": f"http://127.0.0.1:5000/generated/{filename}",
+            "image_url": f"/generated/{filename}",
             "prompt": prompt
         }
 

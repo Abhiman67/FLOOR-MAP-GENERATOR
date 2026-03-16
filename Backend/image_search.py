@@ -92,7 +92,7 @@ class ImageSearchEngine:
             
             results.append({
                 "filename": filename,
-                "image_url": f"http://127.0.0.1:5000/image/{filename}",
+                "image_url": f"/image/{filename}",
                 "metadata": {
                     "similarity_score": round(score, 3),
                     "match_quality": match_quality,

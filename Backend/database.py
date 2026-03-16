@@ -6,9 +6,12 @@ Migrating from CSV to SQLite with vector search capabilities
 import sqlite3
 import json
 import os
+import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 class FloorPlanDatabase:
     """SQLite database manager with vector search support"""
@@ -319,7 +322,7 @@ def migrate_csv_to_db(csv_path: str, db: FloorPlanDatabase, vastu_analyzer=None)
     """Migrate existing CSV data to SQLite database"""
     import csv
     
-    print(f"📊 Starting migration from {csv_path}...")
+    logger.info(f"📊 Starting migration from {csv_path}...")
     
     migrated = 0
     skipped = 0
@@ -374,14 +377,14 @@ def migrate_csv_to_db(csv_path: str, db: FloorPlanDatabase, vastu_analyzer=None)
                 migrated += 1
                 
                 if migrated % 100 == 0:
-                    print(f"  ✓ Migrated {migrated} plans...")
+                    logger.info(f"  ✓ Migrated {migrated} plans...")
                     
             except Exception as e:
-                print(f"  ⚠️  Skipped row: {e}")
+                logger.warning(f"  ⚠️  Skipped row: {e}")
                 skipped += 1
                 continue
     
-    print(f"✅ Migration complete! {migrated} plans migrated, {skipped} skipped.")
+    logger.info(f"✅ Migration complete! {migrated} plans migrated, {skipped} skipped.")
     return migrated, skipped
 
 
